@@ -66,7 +66,7 @@ print(app.get_graph().draw_ascii())
 
 while True:
     try:
-        user_input = input("Input: ")
+        user_input = "臺中"
         if user_input.lower() in ["q", "exit"]:
             break
         for e in app.stream({"messages": [HumanMessage(content=user_input)]}):
