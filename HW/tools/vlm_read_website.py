@@ -25,7 +25,7 @@ def vlm_read_website(url: str, title: str = "網頁內容") -> str:
 
         try:
             with sync_playwright() as p:
-                # 啟動瀏覽器 (Headless 模式)
+                # 啟動瀏覽器（無頭模式）
                 browser = p.chromium.launch(
                     headless=True,
                     args=[
@@ -33,7 +33,7 @@ def vlm_read_website(url: str, title: str = "網頁內容") -> str:
                     ],  # 規避部分反爬蟲
                 )
 
-                # 設定 viewport (模擬桌面瀏覽)
+                # 設定視窗大小（模擬桌面瀏覽）
                 context = browser.new_context(viewport={"width": 1280, "height": 1200})
                 page = context.new_page()
 
@@ -41,13 +41,13 @@ def vlm_read_website(url: str, title: str = "網頁內容") -> str:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(3000)  # 等待渲染
 
-                # --- CSS Injection (去廣告/彈窗) ---
+                # --- CSS 注入（去廣告/彈窗） ---
                 page.add_style_tag(
                     content="""
                     iframe { opacity: 0 !important; pointer-events: none !important; }
                     div[id*='cookie'], div[class*='cookie'], div[id*='ads'], div[class*='ads'] { display: none !important; }
                     div[class*='overlay'], div[id*='overlay'], div[class*='popup'] { opacity: 0 !important; pointer-events: none !important; }
-                    header, nav { position: absolute !important; } /* 防止 sticky header 遮擋截圖 */
+                    header, nav { position: absolute !important; } /* 防止置頂標頭遮擋截圖 */
                 """
                 )
 
@@ -60,10 +60,10 @@ def vlm_read_website(url: str, title: str = "網頁內容") -> str:
                     page.evaluate(f"window.scrollTo(0, {current_scroll})")
                     page.wait_for_timeout(1000)  # 等待滾動後渲染
 
-                    # 截圖並轉 Base64
+                # 截圖並轉為 Base64
                     b64 = base64.b64encode(page.screenshot()).decode("utf-8")
                     screenshots_b64.append(b64)
-                    print(f"   - 截圖 {i+1} 完成 (Scroll: {current_scroll})")
+                    print(f"   - 截圖 {i+1} 完成 (捲動: {current_scroll})")
 
                     current_scroll += viewport_height - 200  # 重疊 200px 避免割裂文字
                     if current_scroll >= total_height:

@@ -10,13 +10,13 @@ def search_searxng(query: str, time_range: str = None, limit: int = 3):
     """
     執行 SearXNG 搜尋並返回結構化結果。
 
-    Args:
+    參數:
         query (str): 搜尋關鍵字
-        time_range (str, optional): 時間範圍 ('day', 'week', 'month', 'year'). Defaults to None.
-        limit (int, optional): 返回結果數量限制. Defaults to 3.
+        time_range (str, optional): 時間範圍 ('day', 'week', 'month', 'year')，預設為 None。
+        limit (int, optional): 返回結果數量限制，預設為 3。
 
-    Returns:
-        list: 搜尋結果列表 (字典格式)
+    回傳:
+        list: 搜尋結果列表（字典格式）
     """
     print(f"🔍 正在搜尋: {query} (範圍: {time_range if time_range else '全部'})")
 

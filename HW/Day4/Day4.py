@@ -9,6 +9,7 @@ from langgraph.graph import StateGraph, END, add_messages
 from langgraph.prebuilt import ToolNode
 import json
 import os
+import re
 
 JSON_PATH = "HW/Day4.json"
 
@@ -41,6 +42,144 @@ class State(TypedDict):
     iteration: int
     max_iterations: int
     max_reached: bool
+    visited_urls: list[str]
+
+
+def _safe_json_loads(text: str):
+    """盡力解析 LLM 輸出的 JSON。"""
+    if not text:
+        return {}
+    cleaned = text.strip()
+    # 移除常見的程式碼框
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"```$", "", cleaned).strip()
+    try:
+        payload = json.loads(cleaned)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        pass
+    # 嘗試擷取第一個 JSON 物件
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            payload = json.loads(match.group(0))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _extract_query_keywords(query: str):
+    if not query:
+        return []
+    cleaned = query.strip()
+    stop_phrases = [
+        "是什麼",
+        "是什麽",
+        "是什麼意思",
+        "是什麽意思",
+        "是啥",
+        "介紹",
+        "官網",
+        "網站",
+        "what is",
+        "who is",
+        "introduction",
+        "official site",
+    ]
+    lowered = cleaned.lower()
+    for phrase in stop_phrases:
+        lowered = lowered.replace(phrase, " ")
+    # 擷取關鍵字
+    cjk = re.findall(r"[\u4e00-\u9fff]{2,}", lowered)
+    alnum = re.findall(r"[a-z0-9][a-z0-9\\-]{2,}", lowered)
+    keywords = [k.strip() for k in (cjk + alnum) if k.strip()]
+    # 但保留順序去重
+    seen = set()
+    deduped = []
+    for k in keywords:
+        if k not in seen:
+            seen.add(k)
+            deduped.append(k)
+    return deduped
+
+
+def _is_relevant(texts: list[str], keywords: list[str]):
+    if not keywords:
+        return True
+    blob = " ".join([t for t in texts if t]).lower()
+    return any(k.lower() in blob for k in keywords)
+
+
+def _looks_like_error(text: str):
+    if not text:
+        return True
+    lowered = text.lower()
+    markers = [
+        "錯誤",
+        "失敗",
+        "error",
+        "timeout",
+        "connection error",
+        "無法讀取",
+        "無足夠資料",
+    ]
+    return any(m in lowered for m in markers)
+
+
+def _llm_cache_error_check(
+    query: str, cache_answer: str, title: str | None = None, url: str | None = None
+):
+    context = {
+        "query": query or "",
+        "cache_answer": cache_answer or "",
+        "title": title or "",
+        "url": url or "",
+    }
+    prompt = [
+        SystemMessage(
+            content=(
+                "你是快取有效性判斷器。"
+                "請判斷 cache_answer 是否像是錯誤訊息、失敗訊息或無法回答的內容。"
+                "只輸出 JSON，不要輸出解釋文字。"
+                '輸出格式：{"invalid":true/false,"reason":"..."}'
+            )
+        ),
+        HumanMessage(content=json.dumps(context, ensure_ascii=False)),
+    ]
+    msg = llm.invoke(prompt)
+    text = (msg.content or "").strip()
+    payload = _safe_json_loads(text)
+    if payload:
+        return bool(payload.get("invalid"))
+    # 若 LLM 回傳不可解析，回退判斷
+    return _looks_like_error(cache_answer)
+
+
+def _purge_cache_entry(path: str, key: str):
+    if not path or not key or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    if isinstance(data.get("items"), dict):
+        items = data["items"]
+    else:
+        items = data
+        data = {"items": items}
+    if not isinstance(items, dict) or key not in items:
+        return
+    items.pop(key, None)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        return
 
 
 def check_cache(state: State):
@@ -64,10 +203,8 @@ def check_cache(state: State):
 
         msg = llm.invoke(prompt)
         text = (msg.content or "").strip()
-        try:
-            key = (json.loads(text).get("key") or "").strip()
-        except Exception:
-            key = ""
+        payload = _safe_json_loads(text)
+        key = (payload.get("key") or "").strip()
 
     path = state.get("json_path")
     if not path or not key:
@@ -102,6 +239,16 @@ def check_cache(state: State):
         if not cached_answer:
             return {"cache_hit": False, "cache_key": key}
 
+        keywords = _extract_query_keywords(state.get("query", ""))
+        invalid_by_llm = _llm_cache_error_check(
+            state.get("query", ""), cached_answer, cached_title, cached_url
+        )
+        if invalid_by_llm or not _is_relevant(
+            [cached_answer, cached_title or "", cached_url or ""], keywords
+        ):
+            _purge_cache_entry(path, key)
+            return {"cache_hit": False, "cache_key": key}
+
         return {
             "cache_hit": True,
             "cache_key": key,
@@ -122,7 +269,7 @@ def planner(state: State):
         "url": state.get("url", ""),
     }
 
-    max_iterations = state.get("max_iterations", 10)
+    max_iterations = state.get("max_iterations", 5)
     iteration = state.get("iteration", 0)
     if iteration >= max_iterations:
         return {
@@ -157,17 +304,17 @@ def planner(state: State):
 
     msg = llm.invoke(prompt)
     text = (msg.content or "").strip()
-    try:
-        payload = json.loads(text)
+    payload = _safe_json_loads(text)
+    if payload:
         enough = bool(payload.get("enough"))
         reason = (payload.get("reason") or "").strip()
         store_ok = bool(payload.get("store_ok"))
         value_reason = (payload.get("value_reason") or "").strip()
-    except Exception:
-        enough = False
-        reason = ""
+    else:
+        enough = bool(context["cache_answer"])
+        reason = "解析 JSON 失敗，改用啟發式判斷"
         store_ok = False
-        value_reason = ""
+        value_reason = "解析 JSON 失敗"
 
     return {
         "info_enough": enough,
@@ -206,6 +353,8 @@ def final_answer(state: State):
     ]
     msg = llm.invoke(prompt)
     answer = (msg.content or "").strip()
+    if "<|im_end|>" in answer:
+        answer = answer.replace("<|im_end|>", "").strip()
 
     if (
         state.get("store_ok")
@@ -274,15 +423,24 @@ def query_gen(state: State):
 
     msg = llm.invoke(prompt)
     text = (msg.content or "").strip()
-    try:
-        payload = json.loads(text)
+    payload = _safe_json_loads(text)
+    if payload:
         q = (payload.get("query") or "").strip()
         strategy = (payload.get("strategy") or "").strip()
         missing_reason = (payload.get("missing_reason") or "").strip()
-    except Exception:
+    else:
         q = ""
         strategy = ""
         missing_reason = ""
+
+    base_query = (state.get("query") or "").strip()
+    if not q:
+        q = (state.get("last_query") or base_query).strip()
+    else:
+        # 確保原始實體留在查詢中，避免翻譯跑偏
+        required = _extract_query_keywords(base_query)
+        if required and not _is_relevant([q], required):
+            q = f"{base_query} {q}".strip()
 
     new_used = used[:]
     if strategy and strategy not in new_used:
@@ -308,13 +466,46 @@ def search_tool(state: State):
     if not results:
         return {"cache_answer": "", "title": "", "url": "", "iteration": iteration}
 
-    top = results[0]
-    title = top.get("title", "")
-    url = top.get("url", "")
-    snippet = (top.get("content") or "").strip()
+    visited = [u for u in (state.get("visited_urls") or []) if u]
+    orig_query = state.get("query", "")
+    keywords = _extract_query_keywords(orig_query)
+    fallback = None
+    chosen = None
+    for item in results:
+        url = (item.get("url") or "").strip()
+        title = item.get("title", "")
+        snippet = (item.get("content") or "").strip()
+        if fallback is None:
+            fallback = item
+        if _is_relevant([title, url, snippet], keywords):
+            if url and url not in visited:
+                chosen = item
+                break
+            if chosen is None:
+                chosen = item
+    if chosen is None:
+        chosen = fallback or results[0]
+
+    title = chosen.get("title", "")
+    url = (chosen.get("url") or "").strip()
+    snippet = (chosen.get("content") or "").strip()
+
+    # 若結果仍不符合原問題，回傳空結果以強制重新查詢
+    if keywords and not _is_relevant([title, url, snippet], keywords):
+        return {
+            "cache_answer": "",
+            "title": "",
+            "url": "",
+            "iteration": iteration,
+            "visited_urls": visited,
+        }
 
     if url:
-        content = vlmrweb(url, title or "網頁內容")
+        if url in visited:
+            content = snippet or "已重複網址，改用搜尋摘要。"
+        else:
+            content = vlmrweb(url, title or "網頁內容")
+            visited.append(url)
     else:
         content = snippet
 
@@ -323,6 +514,7 @@ def search_tool(state: State):
         "title": title,
         "url": url,
         "iteration": iteration,
+        "visited_urls": visited,
     }
 
 
@@ -383,12 +575,13 @@ while True:
         "json_path": JSON_PATH,
         "used_strategies": [],
         "iteration": 0,
-        "max_iterations": 10,
+        "max_iterations": 5,
         "cache_key": "",
         "cache_hit": False,
         "cache_answer": "",
         "search_query": "",
         "time_range": "all",
+        "visited_urls": [],
     }
 
     result = app.invoke(state)
