@@ -3,12 +3,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 import requests
 
-client = QdrantClient(path="./qdrant_local")
+client = QdrantClient(url="http://localhost:6333")
 data = {"texts": ["AI Test"], "normalize": True, "batch_size": 32}
 
 response = requests.post("https://ws-04.wade0426.me/embed", json=data)
-if requests.status_codes == 200:
-    result = response.json
+if response.status_code == 200:
+    result = response.json()
     print(f"CODE：{response.status_code}")
     print(f"回應的内容：{response.text}")
     print(f"維度：{result['dimension']}")

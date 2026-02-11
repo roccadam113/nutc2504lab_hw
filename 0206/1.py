@@ -2,7 +2,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 import requests
 
-client = QdrantClient(path="./qdrant_local")
+client = QdrantClient(url="http://localhost:6333")
 client.create_collection(
     collection_name="text_collection",
     vectors_config=VectorParams(size=4096, distance=Distance.COSINE),
@@ -18,5 +18,6 @@ print(f"回應的内容：{response.text}")
 if requests.status_codes == 200:
     result = response.json()
     print(f"維度：P{result['dimension']}")
+    print(f"END_OK")
 else:
     print(f"錯誤：{response.json()}")
