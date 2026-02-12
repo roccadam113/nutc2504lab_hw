@@ -1,6 +1,4 @@
 .vscode
-*.srt
-*.txt
 scans_temp
 /HW/Day4/__pycache__
 __pycache__/
