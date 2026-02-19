@@ -2,8 +2,8 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
-import requests
 
+import requests
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
@@ -15,12 +15,15 @@ APP_NAME = "tenant-admin-api"
 # ============ Auth ============
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
 
-
 # ============ Grafana ============
 GRAFANA_URL = os.getenv("GRAFANA_URL", "")
 GRAFANA_USER = os.getenv("GRAFANA_USER", "")
 GRAFANA_PASS = os.getenv("GRAFANA_PASS", "")
 GRAFANA_VERIFY_TLS = os.getenv("GRAFANA_VERIFY_TLS", "true").lower() == "true"
+
+# Grafana Prometheus datasource UID (from /api/datasources)
+# Your current Grafana shows Prometheus datasource uid: PBFA97CFB590B2093
+GRAFANA_PROM_DS_UID = os.getenv("GRAFANA_PROM_DS_UID", "PBFA97CFB590B2093")
 
 
 def grafana_enabled() -> bool:
@@ -54,7 +57,7 @@ def grafana_create_folder(title: str) -> Dict[str, Any]:
     if r.status_code in (200, 201):
         return r.json()
 
-    # 412 usually means folder already exists in many setups -> list and find it
+    # 412 often means folder already exists -> list and find it
     if r.status_code == 412:
         try:
             lr = requests.get(
@@ -88,21 +91,109 @@ def grafana_create_folder(title: str) -> Dict[str, Any]:
 
 
 def grafana_create_dashboard(folder_uid: str, title: str) -> Dict[str, Any]:
+    """
+    Create a dashboard containing:
+    - Variables: tenant, api_key
+    - Panels: GPU Util %, GPU Mem (MB), GPU Power (W)
+    Datasource is fixed by Grafana Prometheus datasource UID (GRAFANA_PROM_DS_UID).
+    """
     base = GRAFANA_URL.rstrip("/")
     url = f"{base}/api/dashboards/db"
-    payload = {
-        "folderUid": folder_uid,
-        "overwrite": False,
-        "dashboard": {
-            "uid": None,
-            "title": title,
-            "timezone": "browser",
-            "schemaVersion": 39,
-            "version": 0,
-            "refresh": "10s",
-            "panels": [],
+    ds_uid = GRAFANA_PROM_DS_UID
+
+    dashboard = {
+        "uid": None,
+        "title": title,
+        "timezone": "browser",
+        "schemaVersion": 39,
+        "version": 0,
+        "refresh": "10s",
+        "tags": ["tenant", "gpu", "fake-dcgm"],
+        "templating": {
+            "list": [
+                {
+                    "type": "query",
+                    "name": "tenant",
+                    "label": "Tenant",
+                    "datasource": {"type": "prometheus", "uid": ds_uid},
+                    "query": {"query": "label_values(fake_gpu_utilization_percent, tenant)", "refId": "PromQ"},
+                    "includeAll": True,
+                    "allValue": ".*",
+                    "multi": True,
+                    "refresh": 1,
+                    "current": {"selected": True, "text": "All", "value": [".*"]},
+                },
+                {
+                    "type": "query",
+                    "name": "api_key",
+                    "label": "API Key",
+                    "datasource": {"type": "prometheus", "uid": ds_uid},
+                    "query": {
+                        "query": "label_values(fake_gpu_utilization_percent{tenant=~\"$tenant\"}, api_key)",
+                        "refId": "PromQ",
+                    },
+                    "includeAll": True,
+                    "allValue": ".*",
+                    "multi": True,
+                    "refresh": 1,
+                    "current": {"selected": True, "text": "All", "value": [".*"]},
+                },
+            ]
         },
+        "panels": [
+            {
+                "type": "timeseries",
+                "title": "GPU Utilization (%)",
+                "datasource": {"type": "prometheus", "uid": ds_uid},
+                "gridPos": {"h": 9, "w": 24, "x": 0, "y": 0},
+                "targets": [
+                    {
+                        "refId": "A",
+                        "expr": (
+                            "avg by (tenant, api_key) "
+                            "(fake_gpu_utilization_percent{tenant=~\"$tenant\", api_key=~\"$api_key\"})"
+                        ),
+                        "legendFormat": "{{tenant}} / {{api_key}}",
+                    }
+                ],
+            },
+            {
+                "type": "timeseries",
+                "title": "GPU Memory Used (MB)",
+                "datasource": {"type": "prometheus", "uid": ds_uid},
+                "gridPos": {"h": 9, "w": 24, "x": 0, "y": 9},
+                "targets": [
+                    {
+                        "refId": "A",
+                        "expr": (
+                            "avg by (tenant, api_key) "
+                            "(fake_gpu_memory_used_megabytes{tenant=~\"$tenant\", api_key=~\"$api_key\"})"
+                        ),
+                        "legendFormat": "{{tenant}} / {{api_key}}",
+                    }
+                ],
+            },
+            {
+                "type": "timeseries",
+                "title": "GPU Power (W)",
+                "datasource": {"type": "prometheus", "uid": ds_uid},
+                "gridPos": {"h": 9, "w": 24, "x": 0, "y": 18},
+                "targets": [
+                    {
+                        "refId": "A",
+                        "expr": (
+                            "avg by (tenant, api_key) "
+                            "(fake_gpu_power_watts{tenant=~\"$tenant\", api_key=~\"$api_key\"})"
+                        ),
+                        "legendFormat": "{{tenant}} / {{api_key}}",
+                    }
+                ],
+            },
+        ],
     }
+
+    payload = {"folderUid": folder_uid,
+               "overwrite": True, "dashboard": dashboard}
 
     try:
         r = requests.post(
@@ -172,7 +263,7 @@ def harbor_create_project(project_name: str, visibility: str) -> Dict[str, Any]:
         )
 
     if r.status_code == 409:
-        # already exists -> try lookup id for a nicer response
+        # already exists -> try lookup id for nicer response
         try:
             pr = requests.get(
                 f"{base}/api/v2.0/projects",
@@ -181,7 +272,7 @@ def harbor_create_project(project_name: str, visibility: str) -> Dict[str, Any]:
                 timeout=10,
                 verify=HARBOR_VERIFY_TLS,
             )
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.RequestException:
             return {"project_name": project_name, "project_id": None, "already_exists": True}
 
         pid = None
@@ -262,9 +353,8 @@ def validate_tenant_name(name: str):
             },
         )
 
+
 # ============ K8s client ============
-
-
 def k8s_core() -> client.CoreV1Api:
     """
     In-cluster: config.load_incluster_config()
@@ -278,9 +368,8 @@ def k8s_core() -> client.CoreV1Api:
         config.load_incluster_config()
     return client.CoreV1Api()
 
+
 # ============ API models ============
-
-
 class QuotaModel(BaseModel):
     requests_per_second: int = Field(default=5, ge=1, le=1000)
     burst: int = Field(default=10, ge=1, le=5000)
@@ -343,16 +432,12 @@ def create_tenant(req: CreateTenantRequest, authorization: Optional[str] = Heade
     ns_body = client.V1Namespace(
         metadata=client.V1ObjectMeta(
             name=req.tenant,
-            labels={
-                "tenant": req.tenant,
-                "managed-by": APP_NAME,
-            },
+            labels={"tenant": req.tenant, "managed-by": APP_NAME},
         )
     )
     try:
         v1.create_namespace(ns_body)
     except ApiException as e:
-        # 409 race or already created by someone else
         if e.status == 409:
             raise HTTPException(
                 status_code=409,
@@ -364,6 +449,7 @@ def create_tenant(req: CreateTenantRequest, authorization: Optional[str] = Heade
             detail={"error": "K8S_CREATE_NAMESPACE_FAILED",
                     "message": f"{e.reason}", "details": {"tenant": req.tenant}},
         )
+
     harbor_info = None
     grafana_info = None
 
@@ -402,10 +488,7 @@ def create_tenant(req: CreateTenantRequest, authorization: Optional[str] = Heade
             dash_info = {"dashboard_uid": dash.get(
                 "uid"), "dashboard_url": dash.get("url")}
 
-        grafana_info = {
-            "folder_uid": folder.get("uid"),
-            **(dash_info or {}),
-        }
+        grafana_info = {"folder_uid": folder.get("uid"), **(dash_info or {})}
 
     now = datetime.now(timezone.utc).isoformat()
     return CreateTenantResponse(
