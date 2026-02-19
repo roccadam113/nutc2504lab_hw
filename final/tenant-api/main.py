@@ -16,6 +16,125 @@ APP_NAME = "tenant-admin-api"
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
 
 
+# ============ Grafana ============
+GRAFANA_URL = os.getenv("GRAFANA_URL", "")
+GRAFANA_USER = os.getenv("GRAFANA_USER", "")
+GRAFANA_PASS = os.getenv("GRAFANA_PASS", "")
+GRAFANA_VERIFY_TLS = os.getenv("GRAFANA_VERIFY_TLS", "true").lower() == "true"
+
+
+def grafana_enabled() -> bool:
+    return bool(GRAFANA_URL and GRAFANA_USER and GRAFANA_PASS)
+
+
+def grafana_create_folder(title: str) -> Dict[str, Any]:
+    base = GRAFANA_URL.rstrip("/")
+    url = f"{base}/api/folders"
+    payload = {"title": title}
+
+    try:
+        r = requests.post(
+            url,
+            json=payload,
+            auth=(GRAFANA_USER, GRAFANA_PASS),
+            timeout=10,
+            verify=GRAFANA_VERIFY_TLS,
+        )
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "GRAFANA_UNREACHABLE",
+                "message": "Cannot reach Grafana API (create folder)",
+                "details": {"exception": str(e), "grafana_url": GRAFANA_URL, "title": title},
+            },
+        )
+
+    # 200/201 ok
+    if r.status_code in (200, 201):
+        return r.json()
+
+    # 412 usually means folder already exists in many setups -> list and find it
+    if r.status_code == 412:
+        try:
+            lr = requests.get(
+                f"{base}/api/folders",
+                auth=(GRAFANA_USER, GRAFANA_PASS),
+                timeout=10,
+                verify=GRAFANA_VERIFY_TLS,
+            )
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "GRAFANA_UNREACHABLE",
+                    "message": "Cannot reach Grafana API (list folders)",
+                    "details": {"exception": str(e), "grafana_url": GRAFANA_URL},
+                },
+            )
+        if lr.status_code == 200:
+            for f in lr.json():
+                if f.get("title") == title:
+                    return f
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "error": "GRAFANA_CREATE_FOLDER_FAILED",
+            "message": f"Grafana API returned {r.status_code}",
+            "details": {"status_code": r.status_code, "body": r.text[:300], "title": title},
+        },
+    )
+
+
+def grafana_create_dashboard(folder_uid: str, title: str) -> Dict[str, Any]:
+    base = GRAFANA_URL.rstrip("/")
+    url = f"{base}/api/dashboards/db"
+    payload = {
+        "folderUid": folder_uid,
+        "overwrite": False,
+        "dashboard": {
+            "uid": None,
+            "title": title,
+            "timezone": "browser",
+            "schemaVersion": 39,
+            "version": 0,
+            "refresh": "10s",
+            "panels": [],
+        },
+    }
+
+    try:
+        r = requests.post(
+            url,
+            json=payload,
+            auth=(GRAFANA_USER, GRAFANA_PASS),
+            timeout=10,
+            verify=GRAFANA_VERIFY_TLS,
+        )
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "GRAFANA_UNREACHABLE",
+                "message": "Cannot reach Grafana API (create dashboard)",
+                "details": {"exception": str(e), "grafana_url": GRAFANA_URL, "folder_uid": folder_uid},
+            },
+        )
+
+    if r.status_code == 200:
+        return r.json()
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "error": "GRAFANA_CREATE_DASHBOARD_FAILED",
+            "message": f"Grafana API returned {r.status_code}",
+            "details": {"status_code": r.status_code, "body": r.text[:300], "folder_uid": folder_uid},
+        },
+    )
+
+
 # ============ Harbor ============
 HARBOR_URL = os.getenv("HARBOR_URL", "")
 HARBOR_USER = os.getenv("HARBOR_USER", "")
@@ -33,6 +152,7 @@ def harbor_create_project(project_name: str, visibility: str) -> Dict[str, Any]:
     url = f"{base}/api/v2.0/projects"
     payload = {"project_name": project_name, "public": is_public}
 
+    # Create project
     try:
         r = requests.post(
             url,
@@ -51,7 +171,6 @@ def harbor_create_project(project_name: str, visibility: str) -> Dict[str, Any]:
             },
         )
 
-    # 409: already exists
     if r.status_code == 409:
         return {"project_name": project_name, "project_id": None, "already_exists": True}
 
@@ -65,7 +184,7 @@ def harbor_create_project(project_name: str, visibility: str) -> Dict[str, Any]:
             },
         )
 
-    # 2) Lookup project id
+    # Lookup project id
     try:
         pr = requests.get(
             f"{base}/api/v2.0/projects",
@@ -225,6 +344,9 @@ def create_tenant(req: CreateTenantRequest, authorization: Optional[str] = Heade
                     "message": f"{e.reason}", "details": {"tenant": req.tenant}},
         )
     harbor_info = None
+    grafana_info = None
+
+    # Harbor (optional)
     if req.registry.create_harbor_project:
         if not harbor_enabled():
             raise HTTPException(
@@ -238,13 +360,39 @@ def create_tenant(req: CreateTenantRequest, authorization: Optional[str] = Heade
         harbor_info = harbor_create_project(
             req.tenant, req.registry.visibility)
 
+    # Grafana (optional)
+    if req.observability.create_grafana_folder:
+        if not grafana_enabled():
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "GRAFANA_NOT_CONFIGURED",
+                    "message": "Grafana env vars missing: GRAFANA_URL/GRAFANA_USER/GRAFANA_PASS",
+                    "details": {"tenant": req.tenant},
+                },
+            )
+
+        folder = grafana_create_folder(f"tenant-{req.tenant}")
+
+        dash_info = None
+        if req.observability.create_grafana_dashboard:
+            dash = grafana_create_dashboard(folder.get(
+                "uid"), f"tenant-{req.tenant}-overview")
+            dash_info = {"dashboard_uid": dash.get(
+                "uid"), "dashboard_url": dash.get("url")}
+
+        grafana_info = {
+            "folder_uid": folder.get("uid"),
+            **(dash_info or {}),
+        }
+
     now = datetime.now(timezone.utc).isoformat()
     return CreateTenantResponse(
         tenant=req.tenant,
         status="created",
         k8s={"namespace": req.tenant},
         harbor=harbor_info,
-        grafana=None,
+        grafana=grafana_info,
         created_at=now,
     )
 
